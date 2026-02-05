@@ -438,11 +438,42 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
 
         return order_status
 
-    async def generate_order_status_reports(
+    async def generate_order_status_reports(  # noqa: C901 (complexity due to position adjustment logic)
         self,
         command: GenerateOrderStatusReports,
     ) -> list[OrderStatusReport]:
         report = []
+
+        # Get open orders first - needed for both startup and periodic reconciliation,
+        # and to calculate open order fills for synthetic order adjustment
+        ib_orders: list[IBOrder] = await self._client.get_open_orders(
+            self.account_id.get_id(),
+        )
+
+        # Build a map of instrument_id -> net signed filled quantity from open orders
+        # This is used to adjust synthetic position orders to avoid double-counting
+        # partial fills that will be processed separately from open orders (fixes #3476)
+        open_order_fills: dict[InstrumentId, Decimal] = {}
+
+        for ib_order in ib_orders:
+            order_status = await self._parse_ib_order_to_order_status_report(ib_order)
+            report.append(order_status)
+
+            # Track filled quantities by instrument for synthetic order adjustment
+            if not command.open_only and order_status.filled_qty.as_decimal() > 0:
+                instrument_id = order_status.instrument_id
+                filled_qty = order_status.filled_qty.as_decimal()
+
+                # Convert to signed quantity based on order side
+                if order_status.order_side == OrderSide.BUY:
+                    signed_filled = filled_qty
+                else:  # SELL
+                    signed_filled = -filled_qty
+
+                if instrument_id in open_order_fills:
+                    open_order_fills[instrument_id] += signed_filled
+                else:
+                    open_order_fills[instrument_id] = signed_filled
 
         # Only create synthetic filled orders from positions during startup reconciliation
         # (when open_only=False). During periodic consistency checks (open_only=True),
@@ -458,17 +489,6 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
             ts_init = self._clock.timestamp_ns()
 
             for position in positions:
-                self._log.debug(
-                    f"Infer OrderStatusReport from open position {position.contract}",
-                )
-
-                if position.quantity > 0:
-                    order_side = OrderSide.BUY
-                elif position.quantity < 0:
-                    order_side = OrderSide.SELL
-                else:
-                    continue  # Skip, IB may continue to display closed positions
-
                 instrument = await self.instrument_provider.get_instrument(position.contract)
 
                 if instrument is None:
@@ -482,12 +502,36 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
                         )
                     continue
 
+                # Calculate the adjusted quantity for the synthetic order (fixes #3476)
+                # Position quantity represents the NET position (signed: +ve=LONG, -ve=SHORT)
+                # We subtract filled quantities from open orders to avoid double-counting
+                # Example: position=-1, open_order_fills=+4 (BUY filled 4)
+                #   adjusted = -1 - (+4) = -5, so synthetic SELL 5
+                #   Then: synthetic SELL 5 (-5) + open order BUY 4 (+4) = -1 ✓
+                position_qty = position.quantity
+                open_fills = open_order_fills.get(instrument.id, Decimal(0))
+                adjusted_qty = position_qty - open_fills
+
+                self._log.debug(
+                    f"Infer OrderStatusReport from open position {position.contract}: "
+                    f"position={position_qty}, open_fills={open_fills}, adjusted={adjusted_qty}",
+                )
+
+                if adjusted_qty == 0:
+                    # All fills are accounted for by open orders, no synthetic order needed
+                    continue
+
+                if adjusted_qty > 0:
+                    order_side = OrderSide.BUY
+                else:
+                    order_side = OrderSide.SELL
+
                 contract_details = self.instrument_provider.contract_details[instrument.id]
                 avg_px = instrument.make_price(
                     position.avg_cost
                     / (instrument.multiplier.as_double() * contract_details.priceMagnifier),
                 ).as_decimal()
-                quantity = Quantity.from_str(str(position.quantity.copy_abs()))
+                quantity = Quantity.from_str(str(abs(adjusted_qty)))
                 order_status = OrderStatusReport(
                     account_id=self.account_id,
                     instrument_id=instrument.id,
@@ -507,15 +551,6 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
                 )
                 self._log.debug(f"Received {order_status!r}")
                 report.append(order_status)
-
-        # Create the Open OrderStatusReport from Open Orders
-        ib_orders: list[IBOrder] = await self._client.get_open_orders(
-            self.account_id.get_id(),
-        )
-
-        for ib_order in ib_orders:
-            order_status = await self._parse_ib_order_to_order_status_report(ib_order)
-            report.append(order_status)
 
         return report
 
@@ -1491,8 +1526,10 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
         # Cache filled quantity for use in OrderStatusReport generation during reconciliation.
         # IB's openOrder callback doesn't include accurate filledQuantity, but orderStatus does.
         # venue_order_id is used as key since orderRef may be empty for external orders.
-        if filled > 0 and venue_order_id is not None:
-            self._order_filled_qty[venue_order_id] = filled
+        # Convert to Decimal defensively in case IB API sends it as a string (IB API bug/edge case)
+        filled_decimal = Decimal(filled) if not isinstance(filled, Decimal) else filled
+        if filled_decimal > 0 and venue_order_id is not None:
+            self._order_filled_qty[venue_order_id] = filled_decimal
 
         if order_status in ["ApiCancelled", "Cancelled"]:
             status = OrderStatus.CANCELED
@@ -1621,7 +1658,7 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
             strategy_id=nautilus_order.strategy_id,
             instrument_id=nautilus_order.instrument_id,
             client_order_id=nautilus_order.client_order_id,
-            venue_order_id=get_venue_order_id(execution.orderId, execution.permId),
+            venue_order_id=nautilus_order.venue_order_id,
             venue_position_id=None,
             trade_id=TradeId(execution.execId),
             order_side=OrderSide[ORDER_SIDE_TO_ORDER_ACTION[execution.side]],
@@ -1635,7 +1672,7 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
             ),
             liquidity_side=LiquiditySide.NO_LIQUIDITY_SIDE,
             ts_event=timestring_to_timestamp(execution.time).value,
-            info=info if info else None,
+            info=info or None,
         )
 
         # Update position tracking to avoid duplicate processing
@@ -1780,7 +1817,7 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
                 strategy_id=nautilus_order.strategy_id,
                 instrument_id=nautilus_order.instrument_id,  # Keep spread ID
                 client_order_id=nautilus_order.client_order_id,
-                venue_order_id=get_venue_order_id(execution.orderId, execution.permId),
+                venue_order_id=nautilus_order.venue_order_id,
                 venue_position_id=None,
                 trade_id=TradeId(execution.execId),
                 order_side=combo_order_side,
@@ -1791,7 +1828,7 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
                 commission=commission,
                 liquidity_side=LiquiditySide.NO_LIQUIDITY_SIDE,
                 ts_event=timestring_to_timestamp(execution.time).value,
-                info=info if info else None,
+                info=info or None,
             )
         except Exception as e:
             self._log.error(f"Error generating combo fill: {e}")
@@ -1840,8 +1877,8 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
             leg_trade_id_str = f"{execution.execId}-{leg_position}"
             leg_trade_id = TradeId(leg_trade_id_str)
 
-            # Unique venue_order_id for leg
-            base_venue_order_id = get_venue_order_id(execution.orderId, execution.permId)
+            # Unique venue_order_id for leg, based on parent order's venue_order_id
+            base_venue_order_id = nautilus_order.venue_order_id
             leg_venue_order_id = VenueOrderId(f"{base_venue_order_id.value}-LEG-{leg_position}")
 
             price_magnifier = self.instrument_provider.get_price_magnifier(leg_instrument_id)
@@ -1877,7 +1914,7 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
                 commission=commission,
                 liquidity_side=LiquiditySide.NO_LIQUIDITY_SIDE,
                 ts_event=timestring_to_timestamp(execution.time).value,
-                info=info if info else None,
+                info=info or None,
             )
 
             # Update position tracking to avoid duplicate processing
